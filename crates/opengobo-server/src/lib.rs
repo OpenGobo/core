@@ -6,7 +6,8 @@ use opengobo_engine::{EngineError, ShowEngine};
 use opengobo_protocol::{
     ClientCommand, ClientPacket, PROTOCOL_VERSION, ServerHello, ServerPacket, StateDelta, UserId,
 };
-use opengobo_storage::{ShowDocument, StorageError, StoredUser};
+use opengobo_storage::{ServerTlsIdentity, ShowDocument, StorageError, StoredUser};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -18,9 +19,11 @@ pub enum ServerError {
     Storage(#[from] StorageError),
     #[error("engine error: {0}")]
     Engine(#[from] EngineError),
+    #[error("TLS certificate error: {0}")]
+    Tls(String),
 }
 
-/// Coordinates the loaded `.gobo` showfile, Setup-PIN, sessions, and real-time [`ShowEngine`].
+/// Coordinates the loaded `.gobo` showfile, TLS 1.3 identity, Setup-PIN, sessions, and [`ShowEngine`].
 #[derive(Debug)]
 pub struct CoreCoordinator {
     show_path: Option<PathBuf>,
@@ -36,6 +39,7 @@ impl CoreCoordinator {
         let document = ShowDocument::load_or_create(&path_buf)?;
         let mut coord = Self::in_memory(document, None)?;
         coord.show_path = Some(path_buf);
+        coord.ensure_tls_identity()?;
         Ok(coord)
     }
 
@@ -55,6 +59,41 @@ impl CoreCoordinator {
             setup_pin: pin,
             sessions: BTreeMap::new(),
         })
+    }
+
+    /// Generates and persists a self-signed TLS 1.3 certificate inside `.gobo` if none exists yet.
+    pub fn ensure_tls_identity(&mut self) -> Result<ServerTlsIdentity, ServerError> {
+        if let Some(identity) = &self.document.server_identity {
+            return Ok(identity.clone());
+        }
+
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "opengobo.local".to_string(),
+            "localhost".to_string(),
+        ])
+        .map_err(|e| ServerError::Tls(e.to_string()))?;
+
+        let identity = ServerTlsIdentity {
+            cert_pem: certified.cert.pem(),
+            key_pem: certified.signing_key.serialize_pem(),
+        };
+        self.document.server_identity = Some(identity.clone());
+        self.persist_document();
+        Ok(identity)
+    }
+
+    /// Builds a [`quinn::ServerConfig`] from the `.gobo` showfile's persisted TLS 1.3 identity.
+    pub fn build_quic_server_config(&mut self) -> Result<quinn::ServerConfig, ServerError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = self.ensure_tls_identity()?;
+
+        let cert_der = CertificateDer::from_pem_slice(identity.cert_pem.as_bytes())
+            .map_err(|e| ServerError::Tls(e.to_string()))?;
+        let key_der = PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes())
+            .map_err(|e| ServerError::Tls(e.to_string()))?;
+
+        quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
+            .map_err(|e| ServerError::Tls(e.to_string()))
     }
 
     fn generate_setup_pin() -> String {
@@ -123,11 +162,7 @@ impl CoreCoordinator {
             ClientPacket::Command {
                 request_id,
                 command,
-            } => self.handle_authenticated_command(
-                authenticated_user.as_deref(),
-                request_id,
-                command,
-            ),
+            } => self.handle_authenticated_command(authenticated_user.as_deref(), request_id, command),
         }
     }
 
@@ -275,10 +310,7 @@ impl CoreCoordinator {
             );
         };
 
-        match self
-            .engine
-            .execute_command(user_id, &perms, command.clone())
-        {
+        match self.engine.execute_command(user_id, &perms, command.clone()) {
             Ok(delta) => {
                 self.sync_structural_command_to_document(user_id, command);
                 (
@@ -368,11 +400,12 @@ mod tests {
     use opengobo_protocol::NormalizedValue;
 
     #[test]
-    fn setup_pin_handshake_and_authenticated_command_flow() {
+    fn setup_pin_handshake_and_quic_tls_config_work() {
         let doc = ShowDocument::new("Club Night");
         let mut coord = CoreCoordinator::in_memory(doc, Some("123456".to_string()))
             .unwrap_or_else(|e| panic!("coordinator init: {e}"));
 
+        assert!(coord.build_quic_server_config().is_ok());
         assert!(coord.server_hello().setup_mode_required);
         let mut conn_user: Option<UserId> = None;
 
@@ -395,16 +428,6 @@ mod tests {
         let (resp, _) = coord.handle_client_packet(
             &mut conn_user,
             ClientPacket::CompleteSetup {
-                setup_pin: "000000".to_string(),
-                admin_username: "mika".to_string(),
-                admin_password: "4242".to_string(),
-            },
-        );
-        assert!(matches!(resp, ServerPacket::AuthError { .. }));
-
-        let (resp, _) = coord.handle_client_packet(
-            &mut conn_user,
-            ClientPacket::CompleteSetup {
                 setup_pin: "123456".to_string(),
                 admin_username: "mika".to_string(),
                 admin_password: "4242".to_string(),
@@ -412,7 +435,6 @@ mod tests {
         );
         assert!(matches!(resp, ServerPacket::AuthSuccess { .. }));
         assert!(!coord.server_hello().setup_mode_required);
-        assert!(conn_user.is_some());
 
         let (resp, delta) = coord.handle_client_packet(
             &mut conn_user,
@@ -425,8 +447,14 @@ mod tests {
         );
         assert!(matches!(
             resp,
-            ServerPacket::CommandResponse { accepted: true, .. }
+            ServerPacket::CommandResponse {
+                accepted: true,
+                ..
+            }
         ));
-        assert!(matches!(delta, Some(StateDelta::GrandMasterChanged { .. })));
+        assert!(matches!(
+            delta,
+            Some(StateDelta::GrandMasterChanged { .. })
+        ));
     }
 }

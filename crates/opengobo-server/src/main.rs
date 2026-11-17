@@ -4,12 +4,11 @@ use opengobo_protocol::{
     UserId,
 };
 use opengobo_server::{CoreCoordinator, ServerError};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{info, warn};
@@ -45,17 +44,18 @@ async fn main() -> Result<(), ServerError> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    let coordinator = CoreCoordinator::open(&cli.show)?;
+    let mut coordinator = CoreCoordinator::open(&cli.show)?;
+    let quic_config = coordinator.build_quic_server_config()?;
     let hello = coordinator.server_hello();
     let server_id = Uuid::new_v4().to_string();
 
     info!(
         show_title = %hello.show_title,
         show_file = %cli.show.display(),
-        port = cli.port,
+        quic_port = cli.port,
         discovery_port = cli.discovery_port,
         protocol_version = hello.protocol_version,
-        "OpenGobo core initialized"
+        "OpenGobo core initialized (QUIC / TLS 1.3)"
     );
 
     if let Some(pin) = coordinator.setup_pin() {
@@ -77,7 +77,7 @@ async fn main() -> Result<(), ServerError> {
     let shared = Arc::new(Mutex::new(coordinator));
 
     spawn_discovery_responder(Arc::clone(&shared), server_id, cli.port, cli.discovery_port).await;
-    spawn_client_listener(Arc::clone(&shared), cli.port).await?;
+    spawn_quic_server(Arc::clone(&shared), quic_config, cli.port)?;
 
     let hz = cli.tick_hz.clamp(1, 120);
     let mut ticker = time::interval(Duration::from_micros(1_000_000 / u64::from(hz)));
@@ -137,22 +137,24 @@ async fn spawn_discovery_responder(
     });
 }
 
-async fn spawn_client_listener(
+fn spawn_quic_server(
     coordinator: Arc<Mutex<CoreCoordinator>>,
+    server_config: quinn::ServerConfig,
     port: u16,
 ) -> Result<(), ServerError> {
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .await
-        .map_err(opengobo_storage::StorageError::Io)?;
+    let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let endpoint = quinn::Endpoint::server(server_config, bind_addr)
+        .map_err(|e| ServerError::Tls(e.to_string()))?;
 
-    info!(port, "Client server listener active");
+    info!(port, "QUIC / TLS 1.3 server endpoint listening");
 
     tokio::spawn(async move {
-        while let Ok((stream, peer)) = listener.accept().await {
+        while let Some(incoming) = endpoint.accept().await {
             let coord = Arc::clone(&coordinator);
             tokio::spawn(async move {
-                if let Err(err) = handle_client_stream(coord, stream).await {
-                    warn!(%peer, "Client connection closed: {err}");
+                match incoming.await {
+                    Ok(conn) => handle_quic_connection(coord, conn).await,
+                    Err(err) => warn!("QUIC handshake failed: {err}"),
                 }
             });
         }
@@ -161,42 +163,44 @@ async fn spawn_client_listener(
     Ok(())
 }
 
-async fn handle_client_stream(
+async fn handle_quic_connection(
     coordinator: Arc<Mutex<CoreCoordinator>>,
-    stream: TcpStream,
-) -> std::io::Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    conn: quinn::Connection,
+) {
     let mut authenticated_user: Option<UserId> = None;
 
-    let hello_pkt = {
-        let coord = coordinator.lock().await;
-        ServerPacket::Hello(coord.server_hello())
-    };
-    send_packet(&mut writer, &hello_pkt).await?;
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let hello_pkt = {
+            let coord = coordinator.lock().await;
+            ServerPacket::Hello(coord.server_hello())
+        };
+        if write_quic_packet(&mut send, &hello_pkt).await.is_err() {
+            break;
+        }
 
-    while let Some(line) = lines.next_line().await? {
-        let Ok(client_pkt) = serde_json::from_str::<ClientPacket>(&line) else {
-            continue;
+        let Ok(payload) = recv.read_to_end(65_536).await else {
+            break;
         };
-        let (resp, _delta) = {
-            let mut coord = coordinator.lock().await;
-            coord.handle_client_packet(&mut authenticated_user, client_pkt)
-        };
-        send_packet(&mut writer, &resp).await?;
+        let trimmed = payload.trim_ascii();
+        if !trimmed.is_empty()
+            && let Ok(client_pkt) = serde_json::from_slice::<ClientPacket>(trimmed)
+        {
+            let (resp, _delta) = {
+                let mut coord = coordinator.lock().await;
+                coord.handle_client_packet(&mut authenticated_user, client_pkt)
+            };
+            let _ = write_quic_packet(&mut send, &resp).await;
+        }
+
+        let _ = send.finish();
     }
-
-    Ok(())
 }
 
-async fn send_packet(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_quic_packet(
+    send: &mut quinn::SendStream,
     packet: &ServerPacket,
-) -> std::io::Result<()> {
-    if let Ok(mut json) = serde_json::to_string(packet) {
-        json.push('\n');
-        writer.write_all(json.as_bytes()).await?;
-        writer.flush().await?;
-    }
-    Ok(())
+) -> Result<(), String> {
+    let mut json = serde_json::to_vec(packet).map_err(|e| e.to_string())?;
+    json.push(b'\n');
+    send.write_all(&json).await.map_err(|e| e.to_string())
 }
