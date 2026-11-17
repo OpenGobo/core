@@ -1,3 +1,7 @@
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
+};
 use opengobo_engine::{EngineError, ShowEngine};
 use opengobo_protocol::{
     ClientCommand, ClientPacket, PROTOCOL_VERSION, ServerHello, ServerPacket, StateDelta, UserId,
@@ -151,13 +155,22 @@ impl CoreCoordinator {
             };
         }
 
+        let password_hash = match Self::hash_secret(admin_password) {
+            Ok(h) => h,
+            Err(err) => {
+                return ServerPacket::AuthError {
+                    message: format!("Password hashing failed: {err}"),
+                };
+            }
+        };
+
         let user_id = Uuid::new_v4().to_string();
         self.document.users.insert(
             user_id.clone(),
             StoredUser {
                 id: user_id.clone(),
                 username: username.to_string(),
-                password_hash: Self::hash_secret(admin_password),
+                password_hash,
                 role_ids: vec!["admin".to_string()],
                 overrides: Vec::new(),
                 views: Vec::new(),
@@ -176,12 +189,11 @@ impl CoreCoordinator {
         username: &str,
         password: &str,
     ) -> ServerPacket {
-        let password_hash = Self::hash_secret(password);
         let found_id = self
             .document
             .users
             .values()
-            .find(|u| u.username == username && u.password_hash == password_hash)
+            .find(|u| u.username == username && Self::verify_secret(password, &u.password_hash))
             .map(|u| u.id.clone());
 
         match found_id {
@@ -327,8 +339,20 @@ impl CoreCoordinator {
         }
     }
 
-    fn hash_secret(secret: &str) -> String {
-        format!("opengobo-auth-v1:{secret}")
+    fn hash_secret(secret: &str) -> Result<String, String> {
+        Argon2::default()
+            .hash_password(secret.as_bytes())
+            .map(|h| h.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    fn verify_secret(secret: &str, stored_hash: &str) -> bool {
+        let Ok(parsed) = PasswordHash::new(stored_hash) else {
+            return false;
+        };
+        Argon2::default()
+            .verify_password(secret.as_bytes(), &parsed)
+            .is_ok()
     }
 }
 
