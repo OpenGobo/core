@@ -1,0 +1,16 @@
+[package]
+name = "opengobo-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared data structures, commands, state deltas, and permissions for OpenGobo"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "opengobo-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenGobo core daemon, auth/session guard, setup-PIN manager, and real-time loop"
+
+[[bin]]
+name = "opengobo-core"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+opengobo-engine.workspace = true
+opengobo-fixture.workspace = true
+opengobo-protocol.workspace = true
+opengobo-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

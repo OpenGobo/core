@@ -1,0 +1,16 @@
+[package]
+name = "opengobo-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-memory real-time lighting engine, HTP/LTP mixer, multi-user programmer, and tick loop"
+
+[lints]
+workspace = true
+
+[dependencies]
+opengobo-fixture.workspace = true
+opengobo-protocol.workspace = true
+opengobo-storage.workspace = true
+thiserror.workspace = true
