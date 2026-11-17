@@ -4,12 +4,15 @@ use argon2::{
 };
 use opengobo_engine::{EngineError, ShowEngine};
 use opengobo_protocol::{
-    ClientCommand, ClientPacket, PROTOCOL_VERSION, ServerHello, ServerPacket, StateDelta, UserId,
+    ClientCommand, ClientPacket, PROTOCOL_VERSION, RealtimeDatagram, ServerHello, ServerPacket,
+    StateDelta, UserId,
 };
 use opengobo_storage::{ServerTlsIdentity, ShowDocument, StorageError, StoredUser};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -92,8 +95,14 @@ impl CoreCoordinator {
         let key_der = PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes())
             .map_err(|e| ServerError::Tls(e.to_string()))?;
 
-        quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
-            .map_err(|e| ServerError::Tls(e.to_string()))
+        let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert_der], key_der)
+            .map_err(|e| ServerError::Tls(e.to_string()))?;
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        server_config.transport_config(Arc::new(transport));
+
+        Ok(server_config)
     }
 
     fn generate_setup_pin() -> String {
@@ -164,6 +173,30 @@ impl CoreCoordinator {
                 command,
             } => self.handle_authenticated_command(authenticated_user.as_deref(), request_id, command),
         }
+    }
+
+    pub fn handle_realtime_datagram(
+        &mut self,
+        authenticated_user: Option<&str>,
+        datagram: RealtimeDatagram,
+    ) -> Option<StateDelta> {
+        let cmd = match datagram {
+            RealtimeDatagram::SceneFaderMove { scene_id, level } => {
+                ClientCommand::SetScenePlayback { scene_id, level }
+            }
+            RealtimeDatagram::ProgrammerEncoderMove {
+                fixture_id,
+                attribute,
+                value,
+            } => ClientCommand::SetProgrammerAttribute {
+                fixture_id,
+                attribute,
+                value,
+            },
+            RealtimeDatagram::DmxUniverseFrame { .. } => return None,
+        };
+        let (_, delta) = self.handle_authenticated_command(authenticated_user, 0, cmd);
+        delta
     }
 
     fn handle_complete_setup(

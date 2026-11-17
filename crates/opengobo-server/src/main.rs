@@ -1,15 +1,16 @@
 use clap::Parser;
 use opengobo_protocol::{
-    ClientPacket, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DiscoveryPacket, ServerPacket,
-    UserId,
+    ClientPacket, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DiscoveryPacket, RealtimeDatagram,
+    ServerPacket, StateDelta, UserId,
 };
 use opengobo_server::{CoreCoordinator, ServerError};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::time;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -75,9 +76,10 @@ async fn main() -> Result<(), ServerError> {
     }
 
     let shared = Arc::new(Mutex::new(coordinator));
+    let (delta_tx, _) = broadcast::channel::<StateDelta>(256);
 
     spawn_discovery_responder(Arc::clone(&shared), server_id, cli.port, cli.discovery_port).await;
-    spawn_quic_server(Arc::clone(&shared), quic_config, cli.port)?;
+    spawn_quic_server(Arc::clone(&shared), delta_tx, quic_config, cli.port)?;
 
     let hz = cli.tick_hz.clamp(1, 120);
     let mut ticker = time::interval(Duration::from_micros(1_000_000 / u64::from(hz)));
@@ -139,6 +141,7 @@ async fn spawn_discovery_responder(
 
 fn spawn_quic_server(
     coordinator: Arc<Mutex<CoreCoordinator>>,
+    delta_tx: broadcast::Sender<StateDelta>,
     server_config: quinn::ServerConfig,
     port: u16,
 ) -> Result<(), ServerError> {
@@ -151,9 +154,10 @@ fn spawn_quic_server(
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let coord = Arc::clone(&coordinator);
+            let tx = delta_tx.clone();
             tokio::spawn(async move {
                 match incoming.await {
-                    Ok(conn) => handle_quic_connection(coord, conn).await,
+                    Ok(conn) => handle_quic_connection(coord, tx, conn).await,
                     Err(err) => warn!("QUIC handshake failed: {err}"),
                 }
             });
@@ -165,35 +169,87 @@ fn spawn_quic_server(
 
 async fn handle_quic_connection(
     coordinator: Arc<Mutex<CoreCoordinator>>,
+    delta_tx: broadcast::Sender<StateDelta>,
     conn: quinn::Connection,
 ) {
-    let mut authenticated_user: Option<UserId> = None;
-
-    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-        let hello_pkt = {
-            let coord = coordinator.lock().await;
-            ServerPacket::Hello(coord.server_hello())
-        };
-        if write_quic_packet(&mut send, &hello_pkt).await.is_err() {
-            break;
-        }
-
-        let Ok(payload) = recv.read_to_end(65_536).await else {
-            break;
-        };
-        let trimmed = payload.trim_ascii();
-        if !trimmed.is_empty()
-            && let Ok(client_pkt) = serde_json::from_slice::<ClientPacket>(trimmed)
-        {
-            let (resp, _delta) = {
-                let mut coord = coordinator.lock().await;
-                coord.handle_client_packet(&mut authenticated_user, client_pkt)
-            };
-            let _ = write_quic_packet(&mut send, &resp).await;
-        }
-
-        let _ = send.finish();
+    while let Ok((send, recv)) = conn.accept_bi().await {
+        let coord = Arc::clone(&coordinator);
+        let tx = delta_tx.clone();
+        let conn_clone = conn.clone();
+        tokio::spawn(async move {
+            handle_persistent_stream(coord, tx, conn_clone, send, recv).await;
+        });
     }
+}
+
+async fn handle_persistent_stream(
+    coordinator: Arc<Mutex<CoreCoordinator>>,
+    delta_tx: broadcast::Sender<StateDelta>,
+    conn: quinn::Connection,
+    mut send: quinn::SendStream,
+    recv: quinn::RecvStream,
+) {
+    let mut authenticated_user: Option<UserId> = None;
+    let mut delta_rx = delta_tx.subscribe();
+    let mut lines = BufReader::new(recv).lines();
+
+    let hello_pkt = {
+        let coord = coordinator.lock().await;
+        ServerPacket::Hello(coord.server_hello())
+    };
+    if write_quic_packet(&mut send, &hello_pkt).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            line_res = lines.next_line() => {
+                let Ok(Some(line)) = line_res else {
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(client_pkt) = serde_json::from_str::<ClientPacket>(trimmed) else {
+                    continue;
+                };
+                let (resp, maybe_delta) = {
+                    let mut coord = coordinator.lock().await;
+                    coord.handle_client_packet(&mut authenticated_user, client_pkt)
+                };
+                if write_quic_packet(&mut send, &resp).await.is_err() {
+                    break;
+                }
+                if let Some(delta) = maybe_delta {
+                    let _ = delta_tx.send(delta);
+                }
+            }
+            delta_res = delta_rx.recv() => {
+                if let Ok(delta) = delta_res
+                    && authenticated_user.is_some()
+                    && write_quic_packet(&mut send, &ServerPacket::Delta(delta)).await.is_err()
+                {
+                    break;
+                }
+            }
+            dgram_res = conn.read_datagram() => {
+                if let Ok(bytes) = dgram_res
+                    && let Ok(dgram) = serde_json::from_slice::<RealtimeDatagram>(&bytes)
+                {
+                    let maybe_delta = {
+                        let mut coord = coordinator.lock().await;
+                        coord.handle_realtime_datagram(authenticated_user.as_deref(), dgram)
+                    };
+                    if let Some(delta) = maybe_delta {
+                        let _ = delta_tx.send(delta);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = send.finish();
 }
 
 async fn write_quic_packet(
