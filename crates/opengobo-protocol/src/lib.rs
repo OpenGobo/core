@@ -9,8 +9,8 @@ pub use entities::{
     Scene, SceneId, UniverseId, UserId, UserProfile, UserView,
 };
 pub use messages::{
-    ClientCommand, ClientPacket, RealtimeDatagram, ServerHello, ServerPacket, ShowSnapshot,
-    StateDelta,
+    ClientCommand, ClientPacket, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DiscoveryPacket,
+    RealtimeDatagram, ServerHello, ServerPacket, ShowSnapshot, StateDelta,
 };
 pub use permissions::{
     AccessLevel, EffectivePermissions, Permission, PermissionEffect, PermissionOverride, Resource,

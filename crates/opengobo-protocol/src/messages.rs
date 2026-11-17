@@ -7,6 +7,21 @@ use crate::permissions::EffectivePermissions;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub const DEFAULT_SERVER_PORT: u16 = 9512;
+pub const DEFAULT_DISCOVERY_PORT: u16 = 9513;
+
+/// UDP auto-discovery packet exchanged between `client` and `core` on [`DEFAULT_DISCOVERY_PORT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum DiscoveryPacket {
+    DiscoverRequest,
+    ServerAnnounce {
+        server_id: String,
+        server_port: u16,
+        hello: ServerHello,
+    },
+}
+
 /// Initial greeting sent before authentication (Zero-User-Enumeration: never lists usernames).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerHello {
